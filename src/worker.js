@@ -1,3 +1,8 @@
+import {
+  REVIEWED_RELEASE_CATALOG, GITHUB_REPO, VERSIONED_RELEASE_TAG_RE,
+  validateReleaseCatalog, releaseArtifactEvidence, matchesReviewedSourceObject,
+} from "./release-catalog.js";
+
 // =============================================================================
 // weareone-link.org - Cloudflare Worker
 // =============================================================================
@@ -587,28 +592,14 @@ function nativeAdvert() {
 //   ``source``                           — R2-hosted source archive.
 //   ``android`` / ``ios`` / ``openbsd``  — coming-soon page (honest).
 //
-// Resolution: detect OS + arch + format, choose the matching GitHub asset,
-// then redirect. The default remains the mutable ``auto-latest`` prerelease
-// so existing supported downloads keep working. A deployment can set
-// VERSIONED_RELEASE_TAG to pin all public routes to an explicit v* tag.
-//
-// Why redirect, not proxy: the auto-latest GitHub release is the single
-// source of truth (continuously rebuilt by the One Link repo's CI on
-// every push). Redirecting keeps the user on the freshest artifact
-// without R2 sync infrastructure, and the URL bar shows github.com so
-// the user sees exactly where the bytes are coming from — privacy-by-
-// transparency. R2 stays available for ``/download/source`` because the
-// source-archive path is the canonical mirror.
+// The default remains the mutable auto-latest prerelease. A versioned release
+// activates only when VERSIONED_RELEASE_TAG selects a complete, reviewed
+// catalog checked into this Worker. Tagged standalone artifacts are ZIPs.
+// GitHub serves desktop bytes; the optional source mirror is served from R2.
+// A tag alone is not evidence of signing, source identity, or reproducibility.
 // -----------------------------------------------------------------------------
 
-// ``auto-latest`` is a rolling CI artifact channel. It is not an immutable
-// release and is not evidence of artifact signing, attestation, or
-// reproducibility. VERSIONED_RELEASE_TAG is deliberately opt-in so a future
-// version can be promoted without changing the public download URLs.
-const GITHUB_REPO = "https://github.com/coherence-energy-labs/one-link";
-const VERSIONED_RELEASE_TAG_RE = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z](?:[0-9A-Za-z.-]*[0-9A-Za-z])?)?$/;
-
-function releaseDescriptor(env) {
+function releaseDescriptor(env, catalog) {
   const configured = typeof env?.VERSIONED_RELEASE_TAG === "string"
     ? env.VERSIONED_RELEASE_TAG.trim()
     : "";
@@ -620,6 +611,8 @@ function releaseDescriptor(env) {
   }
   const tag = configured || "auto-latest";
   const versionPinned = Boolean(configured);
+  const reviewed = versionPinned ? validateReleaseCatalog(catalog, tag) : null;
+  if (reviewed && !reviewed.ok) return reviewed;
   return {
     ok: true,
     channel: versionPinned ? "versioned" : "continuous",
@@ -630,8 +623,9 @@ function releaseDescriptor(env) {
     mutable: true,
     immutability: versionPinned ? "not-enforced" : "rolling-channel",
     base_url: `${GITHUB_REPO}/releases/download/${encodeURIComponent(tag)}`,
-    // These stay unavailable until an artifact-bound, signed release catalog
-    // is checked into the Worker. A tag alone is not cryptographic proof.
+    entry: reviewed?.entry || null,
+    // Rolling metadata stays unavailable. Versioned responses below attach
+    // the exact reviewed artifact record without claiming a fresh verification.
     integrity: {
       sha256: null,
       signature: "not-published",
@@ -641,15 +635,30 @@ function releaseDescriptor(env) {
   };
 }
 
-function releaseHeaders(release) {
+function reviewedIntegrity(artifact) {
+  return {
+    sha256: artifact.sha256,
+    signature: "reviewed-sigstore",
+    attestation: "not-verified",
+    // The tagged gate checks Python wheels, not desktop bundle reproducibility.
+    reproducible_build: "not-verified",
+  };
+}
+
+function releaseHeaders(release, artifact = null) {
   return {
     "X-One-Link-Release-Channel": release.channel,
     "X-One-Link-Release-Tag": release.tag,
     "X-One-Link-Version-Pinned": String(release.version_pinned),
     "X-One-Link-Immutability": release.immutability,
-    "X-One-Link-Artifact-Hash": "not-published",
-    "X-One-Link-Artifact-Signature": "not-published",
-    "X-One-Link-Artifact-Attestation": "not-published",
+    "X-One-Link-Artifact-Hash": artifact ? "reviewed-sha256" : "not-published",
+    "X-One-Link-Artifact-Signature": artifact ? "reviewed-sigstore" : "not-published",
+    "X-One-Link-Artifact-Attestation": artifact ? "not-verified" : "not-published",
+    ...(artifact ? {
+      "X-Artifact-SHA256": artifact.sha256,
+      "X-One-Link-Artifact-Size": String(artifact.size_bytes),
+      "X-One-Link-Source-Commit": release.entry.source_commit,
+    } : {}),
   };
 }
 
@@ -659,7 +668,7 @@ function releaseHeaders(release) {
 //   windows-x86_64-zip, macos-arm64-zip, …     — OS + arch + format
 //   windows-zip                                — OS + default arch + portable
 // Plus the legacy plain-OS aliases. Returns null on unparseable input.
-function parsePlatformSpec(spec) {
+function parsePlatformSpec(spec, versioned = false) {
   // Accept what people actually type. "win", "mac", "x64" and a trailing
   // file extension are all ordinary guesses, and every one of them used to
   // return "Nothing here." A download route that only answers its own
@@ -667,7 +676,7 @@ function parsePlatformSpec(spec) {
   let normalized = String(spec || "").toLowerCase().replace(/\/+$/, "");
   const EXTENSION_FORMAT = {
     ".exe": "installer", ".dmg": "installer", ".appimage": "installer",
-    ".msi": "installer", ".zip": "zip", ".tar.gz": "zip",
+    ".msi": "installer", ".zip": "zip", ".tar.gz": versioned ? "tar.gz" : "zip",
   };
   for (const [ext, fmt] of Object.entries(EXTENSION_FORMAT)) {
     if (normalized.endsWith(ext)) {
@@ -706,9 +715,9 @@ function parsePlatformSpec(spec) {
       if (out.format !== null) return null;
       out.format = "zip";
     }
-    else if (p === "installer") {
+    else if (p === "installer" || (versioned && ["exe", "msi", "dmg", "appimage", "tar.gz"].includes(p))) {
       if (out.format !== null) return null;
-      out.format = "installer";
+      out.format = p;
     }
     else return null;
   }
@@ -787,8 +796,10 @@ function chooseAsset(os, arch, format) {
   return null;
 }
 
-async function download(env, platformSpec, request) {
-  const release = releaseDescriptor(env);
+// The optional catalog parameter is a test seam, never an environment binding.
+// The public router always uses the checked-in REVIEWED_RELEASE_CATALOG.
+export async function download(env, platformSpec, request, catalog = REVIEWED_RELEASE_CATALOG) {
+  const release = releaseDescriptor(env, catalog);
   if (!release.ok) {
     return json(
       { error: "release routing is misconfigured", detail: release.error },
@@ -833,13 +844,14 @@ async function download(env, platformSpec, request) {
       return downloadComingSoonPage(detectedOs, detectLanguage(request));
     }
     const detectedArch = detectArchFromUA(ua, detectedOs);
-    const asset = chooseAsset(detectedOs, detectedArch, "installer");
+    const asset = chooseAsset(detectedOs, detectedArch, release.version_pinned ? "zip" : "installer");
+    const reviewedArtifact = release.entry?.artifacts[`${detectedOs}-${detectedArch}`] || null;
     if (asset) {
       const target = `${release.base_url}/${asset}`;
       const headers = new Headers({
         Location: target,
         "Cache-Control": "no-cache, no-store, must-revalidate",
-        ...releaseHeaders(release),
+        ...releaseHeaders(release, reviewedArtifact),
       });
       for (const [k, v] of Object.entries(PRIVACY_HEADERS)) headers.set(k, v);
       return new Response(null, { status: 302, headers });
@@ -852,7 +864,7 @@ async function download(env, platformSpec, request) {
     return downloadComingSoonPage(detectedOs, detectLanguage(request));
   }
 
-  const parsed = parsePlatformSpec(platformSpec);
+  const parsed = parsePlatformSpec(platformSpec, release.version_pinned);
   if (!parsed) {
     // A person in a browser gets the platform picker, which is the thing
     // they were looking for. Machine clients keep the explicit JSON 404 and
@@ -884,13 +896,22 @@ async function download(env, platformSpec, request) {
   }
   const os = parsed.os;
 
-  // Source archive: served from R2 (the 38 MB tarball is too large to
-  // live in the website git history). Both .zip + .tar.gz live in the
-  // bucket; UA decides which gets offered as the default — POSIX
-  // users get .tar.gz, everyone else gets .zip.
+  // The rolling source mirror keeps its existing contract. A versioned source
+  // mirror must contain the exact signed full-source archive reviewed with the
+  // release, not a repackaged Python sdist or an unverified latest/ object.
+  const sourceUa = (request?.headers.get("User-Agent") || "").toLowerCase();
+  const wantsZip = /windows|iphone|ipad|ios|android|mac os/.test(sourceUa);
+  const reviewedSource = release.entry?.source_archives[wantsZip ? "zip" : "tar_gz"] || null;
+  if (os === "source" && release.version_pinned && !reviewedSource) {
+    return json({
+      error: "no reviewed full-source archive is published for this release",
+      status: "source-not-published",
+      release_tag: release.tag,
+      source_commit: release.entry.source_commit,
+      repository: GITHUB_REPO,
+    }, { status: 503 });
+  }
   if (os === "source" && env.RELEASES) {
-    const ua = (request?.headers.get("User-Agent") || "").toLowerCase();
-    const wantsZip = /windows|iphone|ipad|ios|android|mac os/.test(ua);
     const sourcePrefix = release.version_pinned
       ? `releases/${release.tag}`
       : "latest";
@@ -911,6 +932,12 @@ async function download(env, platformSpec, request) {
       );
     }
     if (obj) {
+      if (reviewedSource && !matchesReviewedSourceObject(obj, release.entry, reviewedSource)) {
+        return json({
+          error: "source mirror does not match the reviewed release artifact",
+          status: "invalid-source-object",
+        }, { status: 503 });
+      }
       const headers = new Headers();
       attachArtifactHash(headers, obj);
       const sourceSha256 = headers.get("X-Artifact-SHA256");
@@ -926,11 +953,14 @@ async function download(env, platformSpec, request) {
             mutable: release.mutable,
             immutability: release.immutability,
           },
-          integrity: {
+          ...(reviewedSource ? { artifact: releaseArtifactEvidence(release.entry, reviewedSource) } : {}),
+          integrity: reviewedSource ? reviewedIntegrity(reviewedSource) : {
             ...release.integrity,
             sha256: sourceSha256 || null,
           },
-          note: sourceSha256
+          note: reviewedSource
+            ? "Source mirror matches the reviewed size and R2 upload checksum. Verify the release signature and downloaded bytes before use."
+            : sourceSha256
             ? "A transport checksum is available, but no artifact signature or attestation is published."
             : "No artifact-bound reference hash, signature, or attestation is published.",
         });
@@ -942,10 +972,11 @@ async function download(env, platformSpec, request) {
       );
       headers.set(
         "Cache-Control",
-        "public, max-age=86400"
+        reviewedSource ? "no-store" : "public, max-age=86400"
       );
-      for (const [k, v] of Object.entries(releaseHeaders(release))) headers.set(k, v);
-      if (headers.has("X-Artifact-SHA256")) {
+      for (const [k, v] of Object.entries(releaseHeaders(release, reviewedSource))) headers.set(k, v);
+      if (reviewedSource) headers.set("Content-Length", String(reviewedSource.size_bytes));
+      if (!reviewedSource && headers.has("X-Artifact-SHA256")) {
         headers.set("X-One-Link-Artifact-Hash", "published-unsigned");
       }
       for (const [k, v] of Object.entries(PRIVACY_HEADERS)) headers.set(k, v);
@@ -970,15 +1001,23 @@ async function download(env, platformSpec, request) {
     );
   }
 
-  // Binary platforms: redirect to the matching GitHub auto-latest
-  // asset. No R2 sync infrastructure to maintain — the One Link CI
-  // continuously rebuilds the auto-latest release on every push to
-  // master, and this redirect picks up whatever is freshest.
+  // Desktop bytes stay on GitHub. Tagged releases default to the complete
+  // reviewed ZIP bundle; installer formats require separately published proof.
   if (os === "windows" || os === "macos" || os === "linux") {
     const ua = request?.headers.get("User-Agent") || "";
     const arch = parsed.arch || detectArchFromUA(ua, os);
-    const format = parsed.format || "installer";
+    const format = parsed.format || (release.version_pinned ? "zip" : "installer");
+    if (release.version_pinned && format !== "zip") {
+      return json({
+        error: "requested format is not published in the reviewed tagged release; ZIP bundles are available",
+        status: "unsupported-release-format",
+        os, arch, format,
+        release_tag: release.tag,
+        available: Object.keys(release.entry.artifacts).map(platform => `${platform}-zip`),
+      }, { status: 404 });
+    }
     const asset = chooseAsset(os, arch, format);
+    const reviewedArtifact = release.entry?.artifacts[`${os}-${arch}`] || null;
     if (!asset) {
       if (os === "macos") return unavailableMacArchitecture(request, arch);
       return downloadComingSoonPage(os, detectLanguage(request));
@@ -999,16 +1038,17 @@ async function download(env, platformSpec, request) {
           mutable: release.mutable,
           immutability: release.immutability,
         },
-        integrity: release.integrity,
+        ...(reviewedArtifact ? { artifact: releaseArtifactEvidence(release.entry, reviewedArtifact) } : {}),
+        integrity: reviewedArtifact ? reviewedIntegrity(reviewedArtifact) : release.integrity,
         note: release.version_pinned
-          ? "Version-pinned GitHub URL. Repository maintainers can still replace the asset; no signature or attestation is published by this route."
+          ? "Catalog review recorded exact release bytes and Sigstore evidence. Verify the signature and downloaded bytes before use; this response does not perform client verification or prove desktop reproducibility. GitHub assets can still be replaced."
           : "Mutable GitHub continuous build. It carries a GitHub build-provenance attestation, but it is not a signed, reproducible, immutable release.",
       });
     }
     const headers = new Headers({
       Location: target,
       "Cache-Control": "no-cache, no-store, must-revalidate",
-      ...releaseHeaders(release),
+      ...releaseHeaders(release, reviewedArtifact),
     });
     for (const [k, v] of Object.entries(PRIVACY_HEADERS)) headers.set(k, v);
     return new Response(null, { status: 302, headers });

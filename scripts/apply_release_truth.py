@@ -1461,6 +1461,21 @@ def rewrite_section_heading_and_lede(
     return result
 
 
+def mark_historical_review_stale(text: str, body: str, locale: str) -> str:
+    """Keep the historical date and explicitly scope an expired claims review."""
+    notes = {
+        "en": " This review is stale. Check these claims against the source and current test results before relying on them.",
+        "es": " Esta revisión está desactualizada. Comprueba estas afirmaciones con el código fuente y los resultados de pruebas actuales antes de basarte en ellas.",
+        "fr": " Cette revue est périmée. Vérifiez ces affirmations dans le code source et avec les résultats de tests actuels avant de vous y fier.",
+        "de": " Diese Prüfung ist veraltet. Prüfen Sie diese Aussagen anhand des Quellcodes und aktueller Testergebnisse, bevor Sie sich darauf verlassen.",
+        "pt": " Esta revisão está desatualizada. Confirme estas afirmações no código-fonte e nos resultados de testes atuais antes de confiar nelas.",
+        "it": " Questa revisione è obsoleta. Verifica queste affermazioni nel codice sorgente e con i risultati dei test attuali prima di farvi affidamento.",
+    }
+    updated = body + notes[locale]
+    text = text.replace(f"{body}</p>", f"{updated}</p>")
+    return replace_review_date(text, updated)
+
+
 def replace_review_date(text: str, body: str) -> str:
     """Replace a trailing localized Last reviewed/updated paragraph without faking recency."""
 
@@ -2325,12 +2340,13 @@ def capability_surface_transform(locale: str, slug: str, c: dict[str, object]):
                 "feature updater scope",
                 required=locale == "en",
             )
-            text = replace_review_date(text, "Claims reviewed 2026-07-22.") if locale == "en" else replace_review_date(text, {
+            reviewed = {
+                "en": "Claims reviewed 2026-07-22.",
                 "es": "Afirmaciones revisadas el 2026-07-22.", "fr": "Affirmations revues le 2026-07-22.",
                 "de": "Aussagen am 2026-07-22 geprüft.", "pt": "Afirmações revistas em 2026-07-22.",
                 "it": "Affermazioni riviste il 2026-07-22.",
-            }[locale])
-            return text
+            }
+            return mark_historical_review_stale(text, reviewed[locale], locale)
 
         if slug == "how-it-works":
             text = replace_descriptions(text, str(c["how_desc"]))
@@ -2789,6 +2805,19 @@ def capability_surface_transform(locale: str, slug: str, c: dict[str, object]):
                 "fr": "Déclaration d'accessibilité revue le 2026-07-22.", "de": "Erklärung zur Barrierefreiheit am 2026-07-22 geprüft.",
                 "pt": "Declaração de acessibilidade revista em 2026-07-22.", "it": "Dichiarazione di accessibilità rivista il 2026-07-22.",
             }
+            # Preserve the historical date. Passing time does not establish a
+            # new accessibility review, so label the old assessment explicitly.
+            expired = {
+                "en": " This review is stale; no newer accessibility assessment is published.",
+                "es": " Esta revisión está desactualizada; no se ha publicado una evaluación de accesibilidad más reciente.",
+                "fr": " Cette revue est périmée ; aucune évaluation d'accessibilité plus récente n'est publiée.",
+                "de": " Diese Prüfung ist veraltet; eine neuere Bewertung der Barrierefreiheit ist nicht veröffentlicht.",
+                "pt": " Esta revisão está desatualizada; não foi publicada uma avaliação de acessibilidade mais recente.",
+                "it": " Questa revisione è obsoleta; non è pubblicata una valutazione di accessibilità più recente.",
+            }
+            historical = reviewed[locale]
+            reviewed[locale] += expired[locale]
+            text = text.replace(f"{historical}</p>", f"{reviewed[locale]}</p>")
             return replace_review_date(text, reviewed[locale])
 
         if slug == "mirror":
@@ -2865,7 +2894,7 @@ def capability_surface_transform(locale: str, slug: str, c: dict[str, object]):
                 "fr": "Feuille de route revue le 2026-07-22.", "de": "Roadmap am 2026-07-22 geprüft.",
                 "pt": "Roteiro revisto em 2026-07-22.", "it": "Roadmap rivista il 2026-07-22.",
             }
-            return replace_review_date(text, reviewed[locale])
+            return mark_historical_review_stale(text, reviewed[locale], locale)
 
         if slug == "about":
             text = replace_descriptions(text, str(c["home_social"]))

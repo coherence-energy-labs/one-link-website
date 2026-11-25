@@ -97,6 +97,14 @@ weareone-link.com/*    →  weareone-link-com-redirect Worker
 - `GET  /download/:os`        — platform-aware rolling/version-pinned artifact route with explicit proof status
 - everything else             — static assets from `dist/weareone-link.org/`
 
+Versioned download activation requires a matching reviewed catalog in
+`src/release-catalog.js`. No release is approved in that catalog yet, and this
+preparation leaves rolling production downloads unchanged. Approved tagged
+routes use complete ZIP bundles and expose the recorded source commit, size,
+SHA-256, and Sigstore evidence. A tag setting alone fails closed. See
+[reviewed release promotion](docs/release-promotion.md) for the catalog contract,
+full-source mirror requirements, and activation checks.
+
 The unsigned `/api/capabilities` response is not marketing evidence. Until an
 authenticated, fresh daemon advert exists, an implemented capability claim
 requires a manually reviewed, version-pinned acceptance artifact.
