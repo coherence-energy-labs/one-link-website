@@ -75,8 +75,14 @@ jobs:
   house-rules:
     name: House-rule greps
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: No em-dashes in deployed copy
         run: |
@@ -89,40 +95,16 @@ jobs:
             exit 1
           fi
 
-      - name: "Author identity check (positive: only I-am-One may commit)"
+      - name: Test commit identity gate
+        run: python3 -m unittest discover -s tests -p 'test_commit_identity.py' -v
+
+      - name: Check incoming identities and GitHub integration provenance
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # The org repo expects every commit author + committer to be the
-          # collective pseudonym. Any other identity fails the build. This
-          # protects against accidentally pushing under a non-pseudonym
-          # config without naming the forbidden strings in this file.
-          #
-          # SCOPED TO THE COMMITS THAT WILL LAND, not `--all`.
-          #
-          # On a pull_request, `git log --all` sees the throwaway merge commit GitHub synthesizes
-          # to test the PR. That commit is authored by GitHub and attributed to the PR author's
-          # ACCOUNT identity -- neither is the pseudonym, and neither ever reaches master. With
-          # `--all` this rule therefore failed EVERY pull request while the repository's own
-          # history was spotless (117/117 commits on master are the pseudonym), which made the
-          # repo unable to accept a PR at all.
-          #
-          # The check is not weakened: a PR is judged on exactly the commits it adds, and a push
-          # is still judged on everything.
-          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-            RANGE="$BASE_SHA..$HEAD_SHA"
-            echo "checking the commits this PR adds ($RANGE)"
-          else
-            RANGE="--all"
-            echo "checking every commit in the repository"
-          fi
-          if git log $RANGE --format='%an <%ae>%n%cn <%ce>' \
-               | sort -u \
-               | grep -vE '^I am One <weareone@oneunity\.earth>$'; then
-            echo "::error::non-pseudonym author/committer detected"
-            exit 1
-          fi
+          GITHUB_TOKEN: ${{ github.token }}
+        # Every incoming PR commit still requires collective author and committer.
+        # A landed platform merge needs exact merged-PR and signature evidence.
+        # See docs/commit-identity.md. API/history failures block deployment.
+        run: python3 scripts/check_commit_identity.py
 
       - name: No absolute Windows or macOS user-home paths in deployed surface
         run: |
