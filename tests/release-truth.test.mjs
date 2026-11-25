@@ -327,19 +327,15 @@ test('programmatic release metadata never upgrades a rolling checksum into a sig
   assert.equal(body.integrity.reproducible_build, 'not-verified');
 });
 
-test('an explicit version tag pins routes but does not invent proof', async () => {
+test('a version tag without a reviewed catalog fails closed', async () => {
   const response = await fetchRoute('/download/linux-x86_64', {
     env: { VERSIONED_RELEASE_TAG: 'v1.2.3-rc.1' },
     headers: { Accept: 'application/json' },
   });
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('Location'), null);
   const body = await response.json();
-  assert.equal(body.url, 'https://github.com/coherence-energy-labs/one-link/releases/download/v1.2.3-rc.1/one-link-linux-x86_64.AppImage');
-  assert.equal(body.release.channel, 'versioned');
-  assert.equal(body.release.version_pinned, true);
-  assert.equal(body.release.mutable, true);
-  assert.equal(body.release.immutability, 'not-enforced');
-  assert.equal(body.integrity.signature, 'not-published');
+  assert.match(body.detail, /no reviewed artifact catalog/);
 });
 
 test('invalid version configuration fails closed', async () => {
